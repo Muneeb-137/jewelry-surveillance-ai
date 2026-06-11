@@ -1,0 +1,9 @@
+opencv-python
+numpy
+ultralytics
+tensorflow
+matplotlib
+scikit-learn
+fastapi
+uvicorn
+python-multipart
