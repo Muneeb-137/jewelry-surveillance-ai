@@ -1,0 +1,133 @@
+:root {
+  font-family: Arial, Helvetica, sans-serif;
+  background: #0f172a;
+  color: #e5e7eb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100vh;
+  width: 100%;
+}
+
+body {
+  background: #0f172a;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+/* Compact live dashboard layout */
+.compact-dashboard {
+  grid-template-columns: minmax(0, 1.45fr) minmax(380px, 0.75fr);
+  align-items: stretch;
+  gap: 18px;
+}
+
+.compact-dashboard .camera-section,
+.compact-dashboard .risk-section {
+  min-height: calc(100vh - 170px);
+}
+
+.compact-dashboard .camera-frame {
+  height: calc(100vh - 250px);
+  min-height: 430px;
+}
+
+.compact-dashboard .camera-feed {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.compact-side-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.compact-side-panel h2 {
+  margin-bottom: 0;
+}
+
+.compact-side-panel .risk-box {
+  padding: 14px;
+  margin-bottom: 0;
+}
+
+.compact-side-panel .risk-box h1 {
+  font-size: 46px;
+  margin: 4px 0;
+}
+
+.compact-side-panel .risk-box h2 {
+  font-size: 22px;
+}
+
+.compact-side-panel .reasons-box {
+  padding: 12px;
+  max-height: 135px;
+  overflow-y: auto;
+}
+
+.compact-side-panel .reasons-box h3 {
+  margin-bottom: 8px;
+}
+
+.compact-side-panel .reasons-box ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.compact-side-panel .reasons-box li {
+  margin-bottom: 4px;
+}
+
+.compact-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.compact-grid .info-card {
+  padding: 12px;
+  min-height: 82px;
+}
+
+.compact-grid .info-title {
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.compact-grid .info-value {
+  font-size: 20px;
+}
+
+/* Hide the old bottom grid if any remains */
+.app > .grid {
+  margin-top: 0;
+}
+
+@media (max-width: 1200px) {
+  .compact-dashboard {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-dashboard .camera-frame {
+    height: 460px;
+  }
+
+  .compact-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
