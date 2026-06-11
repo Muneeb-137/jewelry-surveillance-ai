@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*/__pycache__/
+*.pyc
+
+# Runtime/generated files
+backend/latest_frame.jpg
+data/
+*.db
+*.sqlite
+
+# Zip/archive backups
+*.zip
+
+# YOLO / ML models
+*.pt
+*.keras
+*.h5
+
+# Frontend generated files
+frontend/jewelguard-dashboard/node_modules/
+frontend/jewelguard-dashboard/dist/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
