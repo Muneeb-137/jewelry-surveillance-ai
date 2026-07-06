@@ -12,7 +12,7 @@ from backend.database import insert_incident
 
 # ============================================================
 # VaultVision - Vision Engine
-# Mask flagging + wrist-at-case pose alerts + case ROI interaction
+# Mask flagging + customer crowd monitoring
 # ============================================================
 
 from backend.source_config import (
@@ -44,8 +44,6 @@ from backend.retail_config import (
 # -----------------------------
 # Paths
 # -----------------------------
-CASE_ROI_PATH = Path("data/case_roi.json")
-LEGACY_ZONES_PATH = Path("data/security_zones.json")
 SCREENSHOT_DIR = Path("data/screenshots")
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -73,7 +71,6 @@ _PERSON_MODEL_PATH, _PERSON_MODEL_IMGSZ = _resolve_person_model_spec()
 # which re-enables the frontal-face orientation gate at no extra cost.
 # -----------------------------
 person_model = YOLO(_PERSON_MODEL_PATH, task="detect")
-pose_model   = YOLO("yolov8n-pose_openvino_model/", task="pose")
 face_model   = YOLO(FACE_OV_MODEL_PATH,             task="pose")   # pose = detects + 5 kp
 mask_model   = tf.keras.models.load_model(MASK_MODEL_PATH)
 
@@ -86,35 +83,11 @@ FRAME_HEIGHT = 540
 MIRROR_WEBCAM = True
 
 PERSON_CONFIDENCE_THRESHOLD = 0.40
-POSE_CONFIDENCE_THRESHOLD = 0.35
 MASK_IMG_SIZE = (160, 160)
-
-# COCO keypoint indexes from YOLOv8 pose
-LEFT_WRIST = 9
-RIGHT_WRIST = 10
-
-POSE_CONNECTIONS = [
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12), (11, 13),
-    (13, 15), (12, 14), (14, 16),
-]
-
-# -----------------------------
-# Pose / wrist / risk settings
-# -----------------------------
-WRIST_NEAR_CASE_MARGIN = 35
-POSE_RUN_INTERVAL = 2  # run pose every N frames while someone is near the case
-
-# Motion inside case ROI (interaction / touch proxy when pose is occluded)
-CASE_MOTION_LOW = 800
-CASE_MOTION_MEDIUM = 2000
-CASE_MOTION_HIGH = 6000
-CASE_MOTION_RUN_INTERVAL = 1
 
 INCIDENT_SAVE_THRESHOLD = 40
 INCIDENT_COOLDOWN_LIMIT = 90
 FLAG_INCIDENT_COOLDOWN = 45
-WRIST_INCIDENT_COOLDOWN = 30
 MASK_PERSON_INCIDENT_RISK = 40
 MASK_PERSON_INCIDENT_LEVEL = "MEDIUM"
 CROWD_FLAGGED_INCIDENT_RISK_WATCH = 85
@@ -124,8 +97,6 @@ CROWD_FLAGGED_INCIDENT_LEVEL = "HIGH"
 # Person box colors (BGR) — avoid green/red (used on face mask labels)
 PERSON_BOX_NORMAL = (255, 255, 0)     # cyan — neutral tracked person
 PERSON_BOX_FLAGGED = (0, 165, 255)    # orange
-PERSON_BOX_WRIST_NEAR = (0, 140, 255) # orange-red
-PERSON_BOX_WRIST_INSIDE = (0, 0, 255) # red
 
 # -----------------------------
 # Runtime frame state
@@ -169,12 +140,8 @@ PERSON_DEDUPE_MIN_IOU = 0.20    # require some overlap before center-based merge
 # -----------------------------
 # Behavior state
 # -----------------------------
-person_near_start_time = None
-previous_gray_case_roi = None
-
 incident_cooldown_frames = 0
 flag_incident_cooldown_frames = 0
-wrist_incident_cooldown_frames = 0
 _flag_incident_logged_pids = set()
 _crowd_incident_logged = False
 _sticky_flagged_pids = set()
@@ -508,178 +475,6 @@ def get_latest_frame_bytes(view="store"):
 
 
 # ============================================================
-# Jewelry case ROI — rectangle selection (replaces polygon zones)
-# ============================================================
-
-def save_case_roi(roi):
-    CASE_ROI_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(CASE_ROI_PATH, "w") as f:
-        json.dump(roi, f, indent=4)
-
-
-def _roi_from_legacy_zones():
-    """One-time migration from old polygon security_zones.json."""
-    if not LEGACY_ZONES_PATH.exists():
-        return None
-    try:
-        with open(LEGACY_ZONES_PATH, "r") as f:
-            zones = json.load(f)
-        case_zones = zones.get("case_zones") or []
-        if not case_zones:
-            return None
-        polygon = case_zones[0].get("polygon") or []
-        if len(polygon) < 3:
-            return None
-        bbox = polygon_to_bbox(polygon)
-        return {
-            "id": case_zones[0].get("id", "CASE-001"),
-            "name": case_zones[0].get("name", "Jewelry Case"),
-            **bbox,
-        }
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
-def load_case_roi():
-    if CASE_ROI_PATH.exists():
-        with open(CASE_ROI_PATH, "r") as f:
-            data = json.load(f)
-        if all(k in data for k in ("x1", "y1", "x2", "y2")):
-            return data
-
-    legacy = _roi_from_legacy_zones()
-    if legacy is not None:
-        save_case_roi(legacy)
-        print(f"Migrated legacy case polygon → rectangle ROI ({CASE_ROI_PATH})")
-        return legacy
-
-    return None
-
-
-def select_case_roi(frame):
-    """Draw a rectangle around the display case. ENTER/SPACE confirm, C cancel."""
-    print("Draw a rectangle around the jewelry display case.")
-    print("Drag to select, then press ENTER or SPACE. Press C to cancel.")
-
-    selected = cv2.selectROI(
-        "Select Jewelry Case",
-        frame,
-        fromCenter=False,
-        showCrosshair=True,
-    )
-    cv2.destroyWindow("Select Jewelry Case")
-
-    x, y, w, h = selected
-    if w == 0 or h == 0:
-        return None
-
-    return {
-        "id": "CASE-001",
-        "name": "Jewelry Case",
-        "x1": int(x),
-        "y1": int(y),
-        "x2": int(x + w),
-        "y2": int(y + h),
-    }
-
-
-def setup_case_roi(video_source):
-    cap = open_video_capture(video_source)
-
-    if not cap.isOpened():
-        raise Exception("Could not open video source for case ROI setup.")
-
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        raise Exception("Could not read frame for case ROI setup.")
-
-    if video_source == 0 and MIRROR_WEBCAM:
-        frame = cv2.flip(frame, 1)
-
-    frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-    roi = select_case_roi(frame)
-
-    if roi is None:
-        raise Exception("No case ROI selected.")
-
-    save_case_roi(roi)
-    print(f"Case ROI saved to {CASE_ROI_PATH}")
-    return roi
-
-
-def roi_to_box(roi):
-    return (int(roi["x1"]), int(roi["y1"]), int(roi["x2"]), int(roi["y2"]))
-
-
-def point_inside_rect(point, roi):
-    x, y = point
-    return roi["x1"] <= x <= roi["x2"] and roi["y1"] <= y <= roi["y2"]
-
-
-def point_near_rect(point, roi, margin):
-    x, y = point
-    return (
-        roi["x1"] - margin <= x <= roi["x2"] + margin
-        and roi["y1"] - margin <= y <= roi["y2"] + margin
-    )
-
-
-def draw_case_roi(frame, roi, color=(0, 140, 255), label=None):
-    x1, y1, x2, y2 = roi_to_box(roi)
-    label = label or roi.get("name", "Jewelry Case")
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-    cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale, thickness = 0.55, 2
-    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
-    label_y = max(22, y1 - 8)
-    cv2.rectangle(frame, (x1 - 2, label_y - th - 6), (x1 + tw + 8, label_y + 4), (0, 0, 0), -1)
-    cv2.putText(frame, label, (x1, label_y), font, scale, color, thickness)
-
-
-def calculate_motion_in_case_roi(frame, roi):
-    """Frame differencing inside the case rectangle — touch / handling proxy."""
-    global previous_gray_case_roi
-
-    x1, y1, x2, y2 = roi_to_box(roi)
-    roi_frame = frame[y1:y2, x1:x2]
-
-    if roi_frame.size == 0:
-        return 0
-
-    gray_roi = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-    gray_roi = cv2.GaussianBlur(gray_roi, (21, 21), 0)
-
-    if previous_gray_case_roi is None:
-        previous_gray_case_roi = gray_roi
-        return 0
-
-    frame_diff = cv2.absdiff(previous_gray_case_roi, gray_roi)
-    threshold_frame = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)[1]
-    threshold_frame = cv2.dilate(threshold_frame, None, iterations=2)
-    motion_score = int(cv2.countNonZero(threshold_frame))
-
-    previous_gray_case_roi = gray_roi
-    return motion_score
-
-
-def classify_case_motion(motion_score):
-    if motion_score >= CASE_MOTION_HIGH:
-        return "HIGH"
-    if motion_score >= CASE_MOTION_MEDIUM:
-        return "MEDIUM"
-    if motion_score >= CASE_MOTION_LOW:
-        return "LOW"
-    return "NONE"
-
-
-# ============================================================
 # Video capture
 # ============================================================
 
@@ -788,77 +583,8 @@ def draw_polygon_zone(frame, polygon, label, color, show_fill=False):
     )
 
 
-def get_overlap_ratio(person_box, zone_box):
-    px1, py1, px2, py2 = person_box
-    rx1, ry1, rx2, ry2 = zone_box
-
-    overlap_x = max(0, min(px2, rx2) - max(px1, rx1))
-    overlap_y = max(0, min(py2, ry2) - max(py1, ry1))
-
-    overlap_area = overlap_x * overlap_y
-    person_area = max(1, (px2 - px1) * (py2 - py1))
-
-    return overlap_area / person_area
-
-
-# ============================================================
-# Wrist ↔ person association
-# ============================================================
-
-def _point_in_box(point, box, margin=0):
-    x, y = point
-    x1, y1, x2, y2 = box
-    return x1 - margin <= x <= x2 + margin and y1 - margin <= y <= y2 + margin
-
-
-def apply_wrist_flags_to_detections(detections, wrist_points, case_roi):
-    """Tag each tracked person with wrist-near / wrist-inside case flags."""
-    for detection in detections:
-        detection["wrist_near"] = False
-        detection["wrist_inside"] = False
-
-    if not case_roi:
-        return False, False
-
-    wrist_near_case = False
-    wrist_inside_case = False
-
-    for wx, wy in wrist_points:
-        wrist_point = (wx, wy)
-        owner = None
-        best_area = None
-
-        for detection in detections:
-            if not detection.get("registered") or not detection.get("person_near_case"):
-                continue
-            box = detection["box"]
-            if _point_in_box(wrist_point, box, margin=12):
-                area = (box[2] - box[0]) * (box[3] - box[1])
-                if best_area is None or area < best_area:
-                    best_area = area
-                    owner = detection
-
-        inside = point_inside_rect(wrist_point, case_roi)
-        near = point_near_rect(wrist_point, case_roi, WRIST_NEAR_CASE_MARGIN)
-
-        if inside:
-            wrist_inside_case = True
-            wrist_near_case = True
-            if owner is not None:
-                owner["wrist_inside"] = True
-                owner["wrist_near"] = True
-        elif near:
-            wrist_near_case = True
-            if owner is not None:
-                owner["wrist_near"] = True
-
-    return wrist_near_case, wrist_inside_case
-
-
 def compute_alarm_level(
     flagged_count,
-    wrist_near_case,
-    wrist_inside_case,
     crowd_active=False,
     flagged_in_crowd=False,
     staff_mode=False,
@@ -867,19 +593,13 @@ def compute_alarm_level(
         return "NONE"
     if flagged_in_crowd and crowd_active:
         return "CROWD_FLAG"
-    if wrist_inside_case:
-        return "WRIST_INSIDE"
-    if wrist_near_case and flagged_count > 0:
-        return "WRIST_FLAG"
-    if wrist_near_case:
-        return "WRIST_NEAR"
     if flagged_count > 0:
         return "FLAG"
     return "NONE"
 
 
 def draw_person_boxes(frame, detections, person_results, face_by_person=None):
-    """Cyan by default; orange FLAGGED; red when wrist is at the case."""
+    """Cyan by default; orange when mask-flagged."""
     flagged_count = 0
     frame_h = frame.shape[0]
     if face_by_person is None:
@@ -931,22 +651,7 @@ def draw_person_boxes(frame, detections, person_results, face_by_person=None):
         if flagged:
             flagged_count += 1
 
-        wrist_inside = detection.get("wrist_inside", False)
-        wrist_near = detection.get("wrist_near", False)
-
-        if wrist_inside:
-            box_color = PERSON_BOX_WRIST_INSIDE
-            thickness = 3
-            label = "WRIST IN CASE"
-        elif flagged and wrist_near:
-            box_color = PERSON_BOX_WRIST_INSIDE
-            thickness = 3
-            label = "FLAGGED + WRIST"
-        elif wrist_near:
-            box_color = PERSON_BOX_WRIST_NEAR
-            thickness = 2
-            label = "WRIST NEAR CASE"
-        elif flagged:
+        if flagged:
             box_color = PERSON_BOX_FLAGGED
             thickness = 2
             label = f"{pid} {PERSON_FLAG_LABEL}" if pid else PERSON_FLAG_LABEL
@@ -1393,48 +1098,6 @@ def make_face_key(x1, y1, x2, y2):
     """
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     return f"F{cx // 60}x{cy // 60}"
-
-
-def _check_head_frontal(frame):
-    """Use the pose model's COCO keypoints to decide if the face is frontal.
-
-    COCO indices: 0=nose, 1=left_eye, 2=right_eye.
-    In image coordinates y increases downward, so for a frontal face
-    the nose must be at or BELOW the eye midpoint (nose_y >= avg_eye_y).
-    Tilting up pushes the nose above the eyes in the image → returns False.
-
-    Falls back to True when keypoints are missing or have zero confidence.
-    Updates _last_pose_frontal so process_pose_detection doesn't need to
-    repeat the inference on the same frame.
-    """
-    global _last_pose_frontal
-    try:
-        results = pose_model(frame, imgsz=256, conf=0.35, max_det=1, verbose=False)
-        result  = results[0]
-        if result.keypoints is None or len(result.keypoints.xy) == 0:
-            _last_pose_frontal = True
-            return True
-        kp = result.keypoints.xy[0].cpu().numpy()
-        if len(kp) < 3:
-            _last_pose_frontal = True
-            return True
-        nx, ny = float(kp[0][0]), float(kp[0][1])   # nose
-        lx, ly = float(kp[1][0]), float(kp[1][1])   # left_eye
-        rx, ry = float(kp[2][0]), float(kp[2][1])   # right_eye
-        # Zero-value coords mean the keypoint wasn't detected
-        eyes_ok = not (lx == 0 and ly == 0) and not (rx == 0 and ry == 0)
-        nose_ok = not (nx == 0 and ny == 0)
-        if not eyes_ok or not nose_ok:
-            _last_pose_frontal = True
-            return True
-        avg_eye_y = (ly + ry) / 2.0
-        # Nose must be at or below eyes; allow 8 px tolerance
-        frontal = ny >= avg_eye_y - 8
-        _last_pose_frontal = frontal
-        return frontal
-    except Exception:
-        _last_pose_frontal = True
-        return True
 
 
 def _face_yolo_worker():
@@ -2107,12 +1770,8 @@ def assign_session_person_ids(tracked_items, zones=None):
     return assigned
 
 
-def process_person_tracking(frame, case_roi):
-    """
-    YOLO person tracking:
-    - stable session person IDs
-    - person near jewelry case rectangle
-    """
+def process_person_tracking(frame):
+    """YOLO person tracking with stable session person IDs."""
     global last_single_person_id
     global frames_without_person
 
@@ -2158,25 +1817,16 @@ def process_person_tracking(frame, case_roi):
     tracked_items = dedupe_person_detections(raw_items)
     person_ids = assign_session_person_ids(tracked_items, None)
 
-    case_box = roi_to_box(case_roi) if case_roi else None
-
     for item, person_id in zip(tracked_items, person_ids):
         person_box = item["box"]
         confidence = item["confidence"]
-
-        person_near_case = False
-
-        if case_box is not None:
-            overlap_ratio = get_overlap_ratio(person_box, case_box)
-            if overlap_ratio > 0.02:
-                person_near_case = True
 
         detections.append({
             "person_id": person_id,
             "registered": person_id is not None,
             "box": person_box,
             "track_id": item.get("track_id"),
-            "person_near_case": person_near_case,
+            "person_near_case": False,
             "wrist_near": False,
             "wrist_inside": False,
             "confidence": confidence,
@@ -2193,140 +1843,16 @@ def process_person_tracking(frame, case_roi):
         last_single_person_id = registered[0]["person_id"]
 
     total_people = len(registered)
-    people_near_case_count = sum(1 for d in registered if d["person_near_case"])
-    person_near_case = people_near_case_count > 0
-
-    near_case_people = [d for d in registered if d["person_near_case"]]
-
-    if near_case_people:
-        active_person_id = near_case_people[0]["person_id"]
-    elif registered:
-        active_person_id = registered[0]["person_id"]
-    else:
-        active_person_id = "None"
+    active_person_id = registered[0]["person_id"] if registered else "None"
 
     return {
         "total_people": total_people,
         "total_detected": len(detections),
-        "people_near_case_count": people_near_case_count,
-        "person_near_case": person_near_case,
+        "people_near_case_count": 0,
+        "person_near_case": False,
         "active_person_id": active_person_id,
         "detections": detections,
     }
-
-
-# ============================================================
-# Pose / wrist detection with case rectangle ROI
-# ============================================================
-
-def draw_pose_skeleton(frame, keypoints):
-    for start_idx, end_idx in POSE_CONNECTIONS:
-        x1, y1 = keypoints[start_idx]
-        x2, y2 = keypoints[end_idx]
-
-        if x1 <= 0 or y1 <= 0 or x2 <= 0 or y2 <= 0:
-            continue
-
-        cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 2)
-
-    for i, (x, y) in enumerate(keypoints):
-        if x <= 0 or y <= 0:
-            continue
-
-        if i in [LEFT_WRIST, RIGHT_WRIST]:
-            color = (0, 0, 255)
-            radius = 7
-        else:
-            color = (0, 255, 255)
-            radius = 5
-
-        cv2.circle(frame, (int(x), int(y)), radius, color, -1)
-
-def process_pose_detection(frame, case_roi, detections=None):
-    """
-    YOLO pose for wrist-at-case checks against the case rectangle.
-    Called only when at least one person is near the jewelry case.
-    """
-    results = pose_model(
-        frame,
-        imgsz=256,
-        conf=POSE_CONFIDENCE_THRESHOLD,
-        iou=0.60,
-        max_det=10,
-        verbose=False,
-    )
-
-    result = results[0]
-    wrist_points = []
-
-    if result.boxes is None or result.keypoints is None:
-        if detections is not None:
-            return apply_wrist_flags_to_detections(detections, wrist_points, case_roi)
-        return False, False
-
-    keypoints_xy = result.keypoints.xy
-
-    for i in range(len(keypoints_xy)):
-        keypoints = keypoints_xy[i].cpu().numpy()
-        draw_pose_skeleton(frame, keypoints)
-
-        if i == 0 and len(keypoints) >= 3:
-            global _last_pose_frontal
-            nx, ny = float(keypoints[0][0]), float(keypoints[0][1])
-            lx, ly = float(keypoints[1][0]), float(keypoints[1][1])
-            rx, ry = float(keypoints[2][0]), float(keypoints[2][1])
-            eyes_ok = not (lx == 0 and ly == 0) and not (rx == 0 and ry == 0)
-            nose_ok = not (nx == 0 and ny == 0)
-            if eyes_ok and nose_ok:
-                _last_pose_frontal = ny >= (ly + ry) / 2.0 - 8
-
-        for wrist_idx in (LEFT_WRIST, RIGHT_WRIST):
-            wx, wy = keypoints[wrist_idx]
-            if wx > 0 and wy > 0:
-                wrist_points.append((int(wx), int(wy)))
-
-    for wx, wy in wrist_points:
-        if not case_roi:
-            continue
-        wrist_point = (wx, wy)
-
-        if point_inside_rect(wrist_point, case_roi):
-            cv2.circle(frame, wrist_point, 9, (0, 0, 255), -1)
-            cv2.putText(
-                frame,
-                "Wrist inside case",
-                (wx + 10, wy),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2,
-            )
-        elif point_near_rect(wrist_point, case_roi, WRIST_NEAR_CASE_MARGIN):
-            cv2.circle(frame, wrist_point, 8, (0, 165, 255), -1)
-            cv2.putText(
-                frame,
-                "Wrist near case",
-                (wx + 10, wy),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 165, 255),
-                2,
-            )
-
-    if detections is not None:
-        return apply_wrist_flags_to_detections(detections, wrist_points, case_roi)
-
-    wrist_near_case = False
-    wrist_inside_case = False
-    if case_roi:
-        for wx, wy in wrist_points:
-            if point_inside_rect((wx, wy), case_roi):
-                wrist_inside_case = True
-                wrist_near_case = True
-            elif point_near_rect((wx, wy), case_roi, WRIST_NEAR_CASE_MARGIN):
-                wrist_near_case = True
-
-    return wrist_near_case, wrist_inside_case
 
 
 # ============================================================
@@ -2592,7 +2118,6 @@ def log_incident_if_needed(
 ):
     global incident_cooldown_frames
     global flag_incident_cooldown_frames
-    global wrist_incident_cooldown_frames
 
     if cooldown_frames > 0:
         return None
@@ -2636,11 +2161,9 @@ def log_incident_if_needed(
 
     print(f"Incident saved ({subject_tag}): {risk_level} risk")
 
-    if cooldown_limit == WRIST_INCIDENT_COOLDOWN:
-        wrist_incident_cooldown_frames = cooldown_limit
-    elif cooldown_limit == FLAG_INCIDENT_COOLDOWN:
+    if cooldown_limit == FLAG_INCIDENT_COOLDOWN:
         flag_incident_cooldown_frames = cooldown_limit
-    else:
+    elif cooldown_limit > 0:
         incident_cooldown_frames = cooldown_limit
 
     return screenshot_path
@@ -2797,17 +2320,9 @@ def _is_scene_cut(prev_sig, curr_sig):
 def run_vision_loop():
     global engine_running
     global latest_status
-    global person_near_start_time
     global incident_cooldown_frames
     global flag_incident_cooldown_frames
-    global wrist_incident_cooldown_frames
     global _crowd_incident_logged
-
-    global previous_gray_case_roi
-
-    case_roi = load_case_roi()
-    if case_roi is None:
-        case_roi = setup_case_roi(VIDEO_SOURCE)
 
     cap = open_video_capture(VIDEO_SOURCE)
 
@@ -2856,8 +2371,6 @@ def run_vision_loop():
 
     _loop_tick          = 0
     _cached_tracking    = None
-    _cached_pose        = (False, False)
-    _cached_case_motion = 0
     _webcam_blank_streak = 0
     _prev_scene_sig    = None
     _last_scene_cut_at  = 0.0
@@ -2918,7 +2431,7 @@ def run_vision_loop():
                 reset_person_identity_session(reset_tracker=True)
                 _reset_yolo_person_tracker()
                 _cached_tracking = None
-                previous_gray_case_roi = None
+                _prev_scene_sig = None
                 _last_scene_cut_at = now_mono
                 _scene_cut_count += 1
                 latest_status["sceneCutCount"] = _scene_cut_count
@@ -2945,7 +2458,7 @@ def run_vision_loop():
         # Person tracking — interval set in _WEBCAM / _VIDEO config above.
         _track_interval = PERSON_TRACK_INTERVAL
         if _should_run_throttled(_loop_tick, _track_interval) or _cached_tracking is None:
-            tracking_result  = process_person_tracking(frame, case_roi)
+            tracking_result  = process_person_tracking(frame)
             _cached_tracking = tracking_result
         else:
             tracking_result  = _cached_tracking
@@ -3154,43 +2667,14 @@ def run_vision_loop():
         _t_face = time.time()
 
         detections = tracking_result.get("detections", [])
-
-        if total_people == 0 or not person_near_case:
-            wrist_near_case, wrist_inside_case = False, False
-            case_motion_score = 0
-            case_motion_level = "NONE"
-            _cached_case_motion = 0
-            previous_gray_case_roi = None
-            _cached_pose = (False, False)
-            for detection in detections:
-                detection["wrist_near"] = False
-                detection["wrist_inside"] = False
-        else:
-            if _loop_tick % POSE_RUN_INTERVAL == 0:
-                wrist_near_case, wrist_inside_case = process_pose_detection(
-                    frame, case_roi, detections
-                )
-                _cached_pose = (wrist_near_case, wrist_inside_case)
-            else:
-                wrist_near_case, wrist_inside_case = _cached_pose
-
-            if case_roi and _loop_tick % CASE_MOTION_RUN_INTERVAL == 0:
-                _cached_case_motion = calculate_motion_in_case_roi(frame, case_roi)
-            case_motion_score = _cached_case_motion
-            case_motion_level = classify_case_motion(case_motion_score)
-
-        case_interaction = bool(
-            wrist_inside_case or case_motion_level in ("MEDIUM", "HIGH")
-        )
-        _t_pose = time.time()
-
-        if person_near_case:
-            if person_near_start_time is None:
-                person_near_start_time = time.time()
-            loitering_seconds = int(time.time() - person_near_start_time)
-        else:
-            person_near_start_time = None
-            loitering_seconds = 0
+        wrist_near_case = False
+        wrist_inside_case = False
+        case_motion_score = 0
+        case_motion_level = "NONE"
+        case_interaction = False
+        loitering_seconds = 0
+        person_near_case = False
+        people_near_case_count = 0
 
         flagged_count = draw_person_boxes(
             frame, detections, mask_results, face_by_person
@@ -3205,8 +2689,6 @@ def run_vision_loop():
 
         alarm_level = compute_alarm_level(
             flagged_count,
-            wrist_near_case,
-            wrist_inside_case,
             crowd_active=crowd_metrics["crowdActive"],
             flagged_in_crowd=crowd_metrics["flaggedCustomerCount"] > 0,
             staff_mode=_staff_mode_active,
@@ -3217,8 +2699,6 @@ def run_vision_loop():
             incident_cooldown_frames -= 1
         if flag_incident_cooldown_frames > 0:
             flag_incident_cooldown_frames -= 1
-        if wrist_incident_cooldown_frames > 0:
-            wrist_incident_cooldown_frames -= 1
 
         risk_score, risk_level, alert_type, reasons = calculate_risk(
             face_covering_detected=face_covering_detected,
@@ -3249,48 +2729,15 @@ def run_vision_loop():
             entrance_reasons.append(
                 f"Customer group: {crowd_metrics['customerCount']} people ({crowd_metrics['crowdLevel']})"
             )
-            store_reasons.append(
-                f"Customer group: {crowd_metrics['customerCount']} people ({crowd_metrics['crowdLevel']})"
-            )
 
         if crowd_metrics["flaggedCustomerCount"] > 0 and crowd_metrics["crowdActive"]:
             entrance_reasons.append("Flagged person in customer group")
-            store_reasons.append("Flagged person in customer group")
 
-        if person_near_case:
-            store_reasons.append("Person near jewelry display case")
+        store_reasons = list(entrance_reasons)
 
-        if wrist_near_case:
-            store_reasons.append("Wrist/hand near display case boundary")
-
-        if wrist_inside_case:
-            store_reasons.append("Wrist/hand inside display case")
-
-        if case_motion_level in ("MEDIUM", "HIGH"):
-            store_reasons.append(f"Case activity: {case_motion_level}")
-
-        if case_interaction and not wrist_inside_case:
-            store_reasons.append("Interaction detected at display case")
-
-        if loitering_seconds >= 20:
-            store_reasons.append("Loitering near jewelry display")
-
-        if face_covering_detected and person_near_case:
-            store_reasons.append("Flagged person near jewelry case")
-
-        if face_covering_detected and wrist_near_case:
-            store_reasons.append("Flagged person with hand near display case")
-
-        if face_covering_detected and wrist_inside_case:
-            store_reasons.append("Flagged person with hand inside protected case zone")
-
-        # Tab-specific display frames (entrance = clean; store = case rectangle overlay).
-        entrance_display_frame = frame.copy()
-        store_display_frame = frame.copy()
-
-        if case_roi:
-            case_color = (0, 0, 255) if wrist_inside_case else (0, 140, 255)
-            draw_case_roi(store_display_frame, case_roi, color=case_color)
+        display_frame = frame.copy()
+        entrance_display_frame = display_frame
+        store_display_frame = display_frame
 
         alert_image = None
 
@@ -3328,40 +2775,6 @@ def run_vision_loop():
             )
             if alert_image:
                 _crowd_incident_logged = True
-        elif not _staff_mode_active and (wrist_inside_case or (wrist_near_case and flagged_count > 0)):
-            alert_image = log_incident_if_needed(
-                frame=store_display_frame,
-                subject_tag="WRIST_ALERT",
-                risk_score=max(risk_score, 55),
-                risk_level=risk_level if risk_score >= 55 else "MEDIUM",
-                reasons=reasons,
-                mask_label=mask_label,
-                mask_confidence=mask_confidence,
-                face_covering_detected=face_covering_detected,
-                people_near_case_count=people_near_case_count,
-                wrist_near_case=wrist_near_case,
-                loitering_seconds=loitering_seconds,
-                cooldown_frames=wrist_incident_cooldown_frames,
-                cooldown_limit=WRIST_INCIDENT_COOLDOWN,
-                alert_zone="store",
-            )
-        elif wrist_near_case:
-            alert_image = log_incident_if_needed(
-                frame=store_display_frame,
-                subject_tag="WRIST_NEAR",
-                risk_score=max(risk_score, 40),
-                risk_level="MEDIUM",
-                reasons=reasons,
-                mask_label=mask_label,
-                mask_confidence=mask_confidence,
-                face_covering_detected=face_covering_detected,
-                people_near_case_count=people_near_case_count,
-                wrist_near_case=wrist_near_case,
-                loitering_seconds=loitering_seconds,
-                cooldown_frames=wrist_incident_cooldown_frames,
-                cooldown_limit=WRIST_INCIDENT_COOLDOWN,
-                alert_zone="store",
-            )
         elif not _staff_mode_active and flagged_count > 0:
             alert_image = log_flag_incidents_for_people(
                 entrance_display_frame,
@@ -3437,14 +2850,12 @@ def run_vision_loop():
             total_ms   = (_t_end   - _t0)       * 1000
             person_ms  = (_t_person - _t0)       * 1000
             face_ms    = (_t_face   - _t_person) * 1000
-            pose_ms    = (_t_pose   - _t_face)   * 1000
-            other_ms   = (_t_end   - _t_pose)    * 1000
+            other_ms   = (_t_end   - _t_face)    * 1000
             fps        = 1000.0 / max(total_ms, 1)
             print(
                 f"FPS:{fps:5.1f} | "
                 f"person:{person_ms:5.0f}ms | "
                 f"face:{face_ms:5.0f}ms (async) | "
-                f"motion:{pose_ms:5.0f}ms | "
                 f"other:{other_ms:5.0f}ms | "
                 f"total:{total_ms:5.0f}ms"
             )
@@ -3670,8 +3081,6 @@ def start_engine():
     global _mask_vote_masked
     global _mask_vote_unmasked
     global flag_incident_cooldown_frames
-    global wrist_incident_cooldown_frames
-    global previous_gray_case_roi
     global latest_status
     if engine_running:
         return
@@ -3695,8 +3104,6 @@ def start_engine():
     _mask_vote_masked = {}
     _mask_vote_unmasked = {}
     flag_incident_cooldown_frames = 0
-    wrist_incident_cooldown_frames = 0
-    previous_gray_case_roi = None
     _face_yolo_result = []
 
     # Warm up tf.function + Keras (matches classify_mask preprocessing).
